@@ -50,6 +50,7 @@ from ..utils.family import extract_mobject_family_members
 from ..utils.family_ops import restructure_list_to_exclude_certain_family_members
 from ..utils.file_ops import open_media_file
 from ..utils.iterables import list_difference_update, list_update
+from ..utils.sounds import audio_timeline
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -872,10 +873,9 @@ class Scene:
             moving_mobjects,
             use_z_index=self.renderer.camera.use_z_index,
         )
-        static_mobjects = list_difference_update(
-            all_mobject_families,
-            all_moving_mobject_families,
-        )
+        # list_difference_update, without its quadratic list scan (mobjects compare by identity)
+        moving = set(all_moving_mobject_families)
+        static_mobjects = [m for m in all_mobject_families if m not in moving]
         return all_moving_mobject_families, static_mobjects
 
     def compile_animations(
@@ -1626,7 +1626,7 @@ class Scene:
 
         Download the resource for the previous example `here <https://github.com/ManimCommunity/manim/blob/main/docs/source/_static/click.wav>`_ .
         """
-        if self.renderer.skip_animations:
+        if self.renderer.skip_animations and not audio_timeline():
             return
         time = self.time + time_offset
         self.renderer.file_writer.add_sound(sound_file, time, gain, **kwargs)

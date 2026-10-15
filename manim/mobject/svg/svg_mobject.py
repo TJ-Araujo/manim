@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -491,6 +492,17 @@ class VMobjectFromSVGPath(VMobject, metaclass=ConvertToOpenGL):
         self.should_remove_null_curves = should_remove_null_curves
 
         super().__init__(**kwargs)
+
+    def __deepcopy__(self, clone_from_id):
+        # path_obj is only read by init_points at construction; copies share it
+        # instead of deep-copying the parsed SVG path on every animation
+        clone_from_id[id(self.path_obj)] = self.path_obj
+        parent = super()
+        if hasattr(parent, "__deepcopy__"):
+            return parent.__deepcopy__(clone_from_id)
+        # OpenGL bases (swapped in by ConvertToOpenGL) have no __deepcopy__:
+        # do what copy.deepcopy does for them
+        return copy._reconstruct(self, clone_from_id, *self.__reduce_ex__(4))
 
     def init_points(self) -> None:
         # TODO: cache mobject in a re-importable way

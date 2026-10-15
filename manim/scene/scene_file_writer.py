@@ -5,7 +5,10 @@ from __future__ import annotations
 __all__ = ["SceneFileWriter"]
 
 import json
+import os
+import shlex
 import shutil
+import subprocess
 from fractions import Fraction
 from pathlib import Path
 from queue import Queue
@@ -34,7 +37,7 @@ from ..utils.file_ops import (
     modify_atime,
     write_to_movie,
 )
-from ..utils.sounds import get_full_sound_file_path
+from ..utils.sounds import audio_timeline, get_full_sound_file_path
 from .section import DefaultSectionType, Section
 
 if TYPE_CHECKING:
@@ -365,6 +368,9 @@ class SceneFileWriter:
             used there can be referenced here.
 
         """
+        if os.environ.get("MANIM_VIDEO_ONLY") == "1":
+            # chunked renders: the audio comes from a separate full-timeline pass
+            return
         file_path = get_full_sound_file_path(sound_file)
         # we assume files with .wav / .raw suffix are actually
         # .wav and .raw files, respectively.
@@ -530,6 +536,9 @@ class SceneFileWriter:
         This is used internally by Manim initialize the container holding
         the video stream of a partial movie file.
         """
+        if self._ffmpeg_stream_args() is not None:
+            self._open_ffmpeg_stream()
+            return
         if file_path is None:
             file_path = self.partial_movie_files[self.renderer.num_plays]
         self.partial_movie_file_path = file_path
@@ -577,6 +586,8 @@ class SceneFileWriter:
         in the video stream holding a partial file, and then close
         the corresponding container.
         """
+        if self._ffmpeg_stream_args() is not None:
+            return  # the stream stays open across animations
         self.queue.put((-1, None))
         self.writer_thread.join()
 
@@ -610,6 +621,51 @@ class SceneFileWriter:
             / f"{hash_invocation}{config['movie_file_extension']}"
         )
         return path.exists()
+
+    @staticmethod
+    def _ffmpeg_stream_args() -> list[str] | None:
+        """Encoder args from MANIM_FFMPEG_STREAM, e.g. "-c:v h264_nvenc -preset p4 -cq 23".
+
+        When set, every rendered frame goes to one ffmpeg process that writes
+        the scene's movie file directly: no partial movie files, no combine
+        step. The camera's RGBA frames are passed as rgb0 (alpha ignored, as
+        in the yuv420p conversion of the partial movie path).
+        """
+        args = os.environ.get("MANIM_FFMPEG_STREAM")
+        return shlex.split(args) if args else None
+
+    def _open_ffmpeg_stream(self) -> None:
+        if getattr(self, "ffmpeg_process", None) is not None:
+            return
+        cmd = [
+            "ffmpeg", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb0",
+            "-s", f"{config.pixel_width}x{config.pixel_height}",
+            "-r", str(config.frame_rate), "-i", "-", "-an",
+            *self._ffmpeg_stream_args(), "-y", str(self.movie_file_path),
+        ]  # fmt: skip
+        logger.info("Streaming frames to: %(cmd)s", {"cmd": shlex.join(cmd)})
+        self.ffmpeg_process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        self.queue = Queue()
+        self.writer_thread = Thread(target=self._write_ffmpeg_stream, args=())
+        self.writer_thread.start()
+
+    def _write_ffmpeg_stream(self) -> None:
+        stdin = self.ffmpeg_process.stdin
+        while True:
+            num_frames, frame_data = self.queue.get()
+            if frame_data is None:
+                break
+            data = np.ascontiguousarray(frame_data).data
+            for _ in range(num_frames):
+                stdin.write(data)
+
+    def _close_ffmpeg_stream(self) -> None:
+        self.queue.put((-1, None))
+        self.writer_thread.join()
+        self.ffmpeg_process.stdin.close()
+        if self.ffmpeg_process.wait() != 0:
+            raise RuntimeError(f"ffmpeg exited with {self.ffmpeg_process.returncode}")
+        self.ffmpeg_process = None
 
     def combine_files(
         self,
@@ -721,6 +777,14 @@ class SceneFileWriter:
         partial movie files that make up a Scene into a single
         video file for that Scene.
         """
+        if audio_timeline():
+            # every play was skipped: only the scene's audio track is wanted
+            self.add_audio_segment(AudioSegment.silent(0))
+            sound_file_path = self.movie_file_path.with_suffix(".wav")
+            sound_file_path.parent.mkdir(parents=True, exist_ok=True)
+            self.audio_segment.export(sound_file_path, format="wav", bitrate="312k")
+            logger.info("Audio timeline written to %(p)s", {"p": str(sound_file_path)})
+            return
         partial_movie_files = [el for el in self.partial_movie_files if el is not None]
         # NOTE: Here we should do a check and raise an exception if partial
         # movie file is empty.  We can't, as a lot of stuff (in particular, in
@@ -732,17 +796,20 @@ class SceneFileWriter:
         if is_gif_format():
             movie_file_path = self.gif_file_path
 
-        if len(partial_movie_files) == 0:  # Prevent calling concat on empty list
-            logger.info("No animations are contained in this scene.")
-            return
+        if getattr(self, "ffmpeg_process", None) is not None:
+            self._close_ffmpeg_stream()
+        else:
+            if len(partial_movie_files) == 0:  # Prevent calling concat on empty list
+                logger.info("No animations are contained in this scene.")
+                return
 
-        logger.info("Combining to Movie file.")
-        self.combine_files(
-            partial_movie_files,
-            movie_file_path,
-            is_gif_format(),
-            self.includes_sound,
-        )
+            logger.info("Combining to Movie file.")
+            self.combine_files(
+                partial_movie_files,
+                movie_file_path,
+                is_gif_format(),
+                self.includes_sound,
+            )
 
         # handle sound
         if self.includes_sound and config.format != "gif":
@@ -815,7 +882,7 @@ class SceneFileWriter:
             sound_file_path.unlink()
 
         self.print_file_ready_message(str(movie_file_path))
-        if write_to_movie():
+        if write_to_movie() and self._ffmpeg_stream_args() is None:
             for file_path in partial_movie_files:
                 # We have to modify the accessed time so if we have to clean the cache we remove the one used the longest.
                 modify_atime(file_path)

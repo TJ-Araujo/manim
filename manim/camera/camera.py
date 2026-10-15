@@ -29,6 +29,79 @@ from ..utils.images import get_full_raster_image_path
 from ..utils.iterables import list_difference_update
 from ..utils.space_ops import angle_of_vector
 
+try:
+    from . import _cairo_path
+except ImportError:
+    _cairo_path = None
+try:
+    from . import _resample
+except ImportError:
+    _resample = None
+_resample_ok: bool | None = None
+
+
+def _resample_window(
+    src: Image.Image, size: tuple[int, int], box: tuple[int, int, int, int]
+) -> Image.Image:
+    """``src.resize(size, BICUBIC).crop(box)``, computing only the pixels
+    inside box (``src`` is RGBA)."""
+    x0, y0, x1, y1 = box
+    src = src.convert("RGBa")
+    window = _resample.bicubic_window(src.tobytes(), *src.size, *size, x0, x1, y0, y1)
+    return Image.frombytes("RGBa", (x1 - x0, y1 - y0), window).convert("RGBA")
+
+
+def _native_resample_ok() -> bool:
+    """Whether _resample reproduces the installed Pillow exactly.
+
+    It ports Pillow 12.3's bicubic resize, so it is checked once against
+    Pillow and the plain resize is used if any pixel differs.
+    """
+    global _resample_ok
+    if _resample_ok is None:
+        _resample_ok = _resample is not None and _resample_matches_pillow()
+        if _resample is not None and not _resample_ok:
+            logger.warning(
+                "Pillow %s: native image resize differs, using Pillow's",
+                Image.__version__,
+            )
+    return _resample_ok
+
+
+def _resample_matches_pillow() -> bool:
+    rng = np.random.default_rng(0)
+    pixels = rng.integers(0, 256, (96, 128, 4), dtype=np.uint8)
+    pixels[..., 3] = rng.choice((0, 1, 128, 254, 255), (96, 128))
+    src = Image.fromarray(pixels, "RGBA")
+    # Magnified, minified, and magnified one way while minified the other.
+    # Smaller sources let a sub-LSB rounding change through.
+    for size, box in (
+        ((600, 400), (10, 7, 590, 390)),
+        ((40, 30), (1, 1, 39, 29)),
+        ((400, 60), (3, 0, 397, 60)),
+    ):
+        ref = src.resize(size, resample=Image.Resampling.BICUBIC).crop(box)
+        if ref.tobytes() != _resample_window(src, size, box).tobytes():
+            return False
+    return True
+
+_PATH_METHODS = (
+    "consider_points_equals_2d",
+    "_gen_subpaths_from_points",
+    "gen_subpaths_from_points_2d",
+    "gen_cubic_bezier_tuples_from_points",
+)
+_native_path_ok: dict[type, bool] = {}
+
+
+def _uses_vmobject_path_methods(cls: type) -> bool:
+    # _cairo_path reimplements these VMobject methods; a subclass override must take the Python path
+    ok = _native_path_ok.get(cls)
+    if ok is None:
+        ok = all(getattr(cls, m) is getattr(VMobject, m) for m in _PATH_METHODS)
+        _native_path_ok[cls] = ok
+    return ok
+
 LINE_JOIN_MAP = {
     LineJointType.AUTO: None,  # TODO: this could be improved
     LineJointType.ROUND: cairo.LineJoin.ROUND,
@@ -688,6 +761,21 @@ class Camera:
         if len(points) == 0:
             return
 
+        if (
+            _cairo_path is not None
+            and points.dtype == np.float64
+            and points.ndim == 2
+            and points.shape[1] == 3
+            and vmobject.n_points_per_cubic_curve == 4
+            and _uses_vmobject_path_methods(type(vmobject))
+        ):
+            _cairo_path.set_path(
+                ctx,
+                np.ascontiguousarray(points),
+                vmobject.tolerance_for_point_equality,
+            )
+            return self
+
         ctx.new_path()
         subpaths = vmobject.gen_subpaths_from_points_2d(points)
         for subpath in subpaths:
@@ -984,6 +1072,16 @@ class Camera:
         # Reshape
         pixel_width = max(int(pdist([ul_coords, ur_coords]).item()), 1)
         pixel_height = max(int(pdist([ul_coords, dl_coords]).item()), 1)
+        if self._display_image_window(
+            image_mobject,
+            sub_image,
+            pixel_width,
+            pixel_height,
+            right_vect,
+            center_coords,
+            pixel_array,
+        ):
+            return
         sub_image = sub_image.resize(
             (pixel_width, pixel_height),
             resample=image_mobject.resampling_algorithm,
@@ -1019,6 +1117,51 @@ class Camera:
         )
         # Paint on top of existing pixel array
         self.overlay_PIL_image(pixel_array, full_image)
+
+    def _display_image_window(
+        self,
+        image_mobject: AbstractImageMobject,
+        sub_image: Image.Image,
+        pixel_width: int,
+        pixel_height: int,
+        right_vect: np.ndarray,
+        center_coords: np.ndarray,
+        pixel_array: np.ndarray,
+    ) -> bool:
+        """Resample only the part of a zoomed image that lands in the frame.
+
+        Same pixels as the resize + paste in display_image_mobject, which can
+        resize to several times the frame size only to crop it. Returns False
+        when that path must run instead (rotation, other filter, fully visible).
+        """
+        if (
+            image_mobject.resampling_algorithm != Image.Resampling.BICUBIC
+            or -int(360 * angle_of_vector(right_vect) / TAU) != 0
+            or sub_image.size == (pixel_width, pixel_height)
+            or not _native_resample_ok()
+        ):
+            return False
+        ul = (center_coords - np.array((pixel_width, pixel_height)) / 2).astype(int)
+        x0, y0 = max(0, -ul[0]), max(0, -ul[1])
+        x1 = min(pixel_width, self.pixel_width - ul[0])
+        y1 = min(pixel_height, self.pixel_height - ul[1])
+        if x0 == 0 and y0 == 0 and x1 == pixel_width and y1 == pixel_height:
+            return False
+        full_image = Image.fromarray(
+            np.zeros((self.pixel_height, self.pixel_width)),
+            mode="RGBA",
+        )
+        if x0 < x1 and y0 < y1:
+            window = _resample_window(
+                sub_image,
+                (pixel_width, pixel_height),
+                (int(x0), int(y0), int(x1), int(y1)),
+            )
+            full_image.paste(
+                window, box=(ul[0] + x0, ul[1] + y0, ul[0] + x1, ul[1] + y1)
+            )
+        self.overlay_PIL_image(pixel_array, full_image)
+        return True
 
     def overlay_rgba_array(self, pixel_array: np.ndarray, new_array: np.ndarray):
         """Overlays an RGBA array on top of the given Pixel array.
