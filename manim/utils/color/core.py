@@ -65,6 +65,7 @@ three important methods:
 from __future__ import annotations
 
 import colorsys
+import copy
 
 # logger = _config.logger
 import random
@@ -963,6 +964,14 @@ class ManimColor:
         """
         # TODO: implement proper gradient, research good implementation for this or look at 3b1b implementation
         raise NotImplementedError
+
+    def __deepcopy__(self, memo: dict) -> Self:
+        # what the generic protocol does (new object, then a deep copy of
+        # __dict__), without its __reduce_ex__ round trip
+        result = self.__class__.__new__(self.__class__)
+        memo[id(self)] = result
+        result.__dict__.update(copy.deepcopy(self.__dict__, memo))
+        return result
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}('{self.to_hex()}')"

@@ -42,6 +42,103 @@ if TYPE_CHECKING:
     )
 
 
+try:
+    from . import _cairo_path  # type: ignore[attr-defined]
+except ImportError:
+    _cairo_path = None
+try:
+    from . import _transform  # type: ignore[attr-defined]
+except ImportError:
+    _transform = None
+_transform_ok: bool | None = None
+
+
+def _transform_window(
+    src: Image.Image,
+    size: tuple[int, int],
+    coefficients: Iterable[float],
+    resample: int,
+    box: tuple[int, int, int, int],
+) -> Image.Image:
+    """``src.transform(size, PERSPECTIVE, coefficients, resample).crop(box)``,
+    computing only the pixels inside box (``src`` is RGBA).
+    """
+    x0, y0, x1, y1 = box
+    # Image.transform premultiplies alpha for every filter but NEAREST
+    mode = "RGBA" if int(resample) == Image.Resampling.NEAREST else "RGBa"
+    src = src.convert(mode) if mode != src.mode else src
+    window = _transform.perspective_window(
+        src.tobytes(),
+        *src.size,
+        tuple(float(c) for c in coefficients),
+        int(resample),
+        x0,
+        x1,
+        y0,
+        y1,
+    )
+    return Image.frombytes(mode, (x1 - x0, y1 - y0), window).convert("RGBA")
+
+
+def _native_transform_ok() -> bool:
+    """Whether _transform reproduces the installed Pillow exactly.
+
+    It ports Pillow 12.3's filters, so it is checked once against Pillow
+    and the plain transform is used if any pixel differs.
+    """
+    global _transform_ok
+    if _transform_ok is None:
+        _transform_ok = _transform is not None and _transform_matches_pillow()
+        if _transform is not None and not _transform_ok:
+            logger.warning(
+                "Pillow %s: native image transform differs, using Pillow's",
+                Image.__version__,
+            )
+    return _transform_ok
+
+
+def _transform_matches_pillow() -> bool:
+    rng = np.random.default_rng(0)
+    pixels = rng.integers(0, 256, (9, 13, 4), dtype=np.uint8)
+    pixels[..., 3] = rng.choice((0, 1, 128, 254, 255), (9, 13))
+    src = Image.fromarray(pixels, "RGBA")
+    cases = (
+        # magnified, slight perspective, reaching past the source edges
+        ((70, 50), (0.21, 0.03, -1.7, -0.02, 0.19, -0.9, 4e-4, -3e-4), (5, 3, 61, 44)),
+        # minified and rotated
+        ((9, 7), (1.1, -0.6, 2.0, 0.5, 1.2, -1.0, 1e-3, 2e-3), (1, 1, 8, 6)),
+    )
+    for size, coefficients, box in cases:
+        for resample in (
+            Image.Resampling.NEAREST,
+            Image.Resampling.BILINEAR,
+            Image.Resampling.BICUBIC,
+        ):
+            ref = src.transform(
+                size, Image.Transform.PERSPECTIVE, coefficients, resample
+            ).crop(box)
+            got = _transform_window(src, size, coefficients, resample, box)
+            if ref.tobytes() != got.tobytes():
+                return False
+    return True
+
+
+_PATH_METHODS = (
+    "consider_points_equals_2d",
+    "get_subpath_split_indices_from_points",
+)
+_native_path_ok: dict[type, bool] = {}
+
+
+def _uses_vmobject_path_methods(cls: type) -> bool:
+    # _cairo_path reimplements these VMobject methods; a subclass override must take the Python path
+    ok = _native_path_ok.get(cls)
+    if ok is None:
+        ok = all(getattr(cls, m) is getattr(VMobject, m) for m in _PATH_METHODS)
+        _native_path_ok[cls] = ok
+    return ok
+
+
 LINE_JOIN_MAP = {
     LineJointType.AUTO: cairo.LineJoin.MITER,  # cairo default; TODO: this could be improved
     LineJointType.ROUND: cairo.LineJoin.ROUND,
@@ -716,6 +813,21 @@ class Camera:
 
         nppcc = vmobject.n_points_per_cubic_curve  # 4 for cubic bezier
 
+        if (
+            _cairo_path is not None
+            and points.dtype == np.float64
+            and points.ndim == 2
+            and points.shape[1] == 3
+            and vmobject.n_points_per_cubic_curve == 4
+            and _uses_vmobject_path_methods(type(vmobject))
+        ):
+            _cairo_path.set_path(
+                ctx,
+                np.ascontiguousarray(points),
+                vmobject.tolerance_for_point_equality,
+            )
+            return self
+
         ctx.new_path()
 
         # Subpath boundaries are computed by VMobject; a split occurs wherever
@@ -1117,29 +1229,78 @@ class Camera:
             # In this case, do nothing and return.
             return
 
-        sub_image = sub_image.transform(
-            size=target_size,  # Use the smallest possible size for speed.
-            method=Image.Transform.PERSPECTIVE,
-            data=transform_coefficients,
-            resample=image_mobject.resampling_algorithm,
-        )
-
         # Paste into an image as large as the camera's pixel array.
         full_image = Image.fromarray(
             np.zeros((self.pixel_height, self.pixel_width)),
             mode="RGBA",
         )
-        full_image.paste(
+        visible = self._visible_transform(
             sub_image,
-            box=(
-                shift_vector[0],
-                shift_vector[1],
-                shift_vector[0] + target_size[0],
-                shift_vector[1] + target_size[1],
-            ),
+            target_size,
+            shift_vector,
+            transform_coefficients,
+            image_mobject.resampling_algorithm,
         )
+        if visible is not None:
+            if visible:
+                full_image.paste(*visible)
+        else:
+            sub_image = sub_image.transform(
+                size=target_size,  # Use the smallest possible size for speed.
+                method=Image.Transform.PERSPECTIVE,
+                data=transform_coefficients,
+                resample=image_mobject.resampling_algorithm,
+            )
+            full_image.paste(
+                sub_image,
+                box=(
+                    shift_vector[0],
+                    shift_vector[1],
+                    shift_vector[0] + target_size[0],
+                    shift_vector[1] + target_size[1],
+                ),
+            )
         # Paint on top of existing pixel array.
         self.overlay_PIL_image(pixel_array, full_image)
+
+    def _visible_transform(
+        self,
+        sub_image: Image.Image,
+        target_size: tuple[int, int],
+        shift_vector: np.ndarray,
+        coefficients: np.ndarray,
+        resample: int,
+    ) -> tuple[Image.Image, tuple[int, int, int, int]] | tuple[()] | None:
+        """The part of the perspective transform that lands in the frame.
+
+        A zoomed image can be transformed to several times the frame size and
+        then mostly cropped by paste(). This computes only the visible pixels,
+        identical to sub_image.transform(...) cropped. Returns the (image, box)
+        to paste, () when nothing is visible, or None when the full transform
+        must run instead.
+        """
+        if (
+            sub_image.mode != "RGBA"
+            or int(resample)
+            not in (
+                Image.Resampling.NEAREST,
+                Image.Resampling.BILINEAR,
+                Image.Resampling.BICUBIC,
+            )
+        ) or not _native_transform_ok():
+            return None
+        sx, sy = int(shift_vector[0]), int(shift_vector[1])
+        x0, y0 = max(0, -sx), max(0, -sy)
+        x1 = int(min(target_size[0], self.pixel_width - sx))
+        y1 = int(min(target_size[1], self.pixel_height - sy))
+        if (x0, y0, x1, y1) == (0, 0, *target_size):
+            return None
+        if x0 >= x1 or y0 >= y1:
+            return ()
+        window = _transform_window(
+            sub_image, target_size, coefficients, resample, (x0, y0, x1, y1)
+        )
+        return window, (sx + x0, sy + y0, sx + x1, sy + y1)
 
     def overlay_rgba_array(
         self, pixel_array: np.ndarray, new_array: np.ndarray

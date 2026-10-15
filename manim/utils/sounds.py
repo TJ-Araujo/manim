@@ -6,6 +6,7 @@ __all__ = [
     "get_full_sound_file_path",
 ]
 
+import os
 from typing import TYPE_CHECKING
 
 from ..utils.file_ops import seek_full_path_from_defaults
@@ -14,6 +15,13 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from manim.typing import StrPath
+
+
+def audio_timeline() -> bool:
+    """MANIM_AUDIO_TIMELINE=1: skip every animation but advance time as if
+    rendering and keep the sounds, then write only the scene's .wav.
+    """
+    return os.environ.get("MANIM_AUDIO_TIMELINE") == "1"
 
 
 # Still in use by add_sound() function in scene_file_writer.py

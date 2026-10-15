@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 from typing import Any, Self
@@ -554,6 +555,21 @@ class VMobjectFromSVGPath(VMobject, metaclass=ConvertToOpenGL):
             )
 
         super().__init__(**kwargs)
+
+    def __deepcopy__(self, clone_from_id: dict[int, Any]) -> Self:
+        # path_obj is only read by generate_points at construction; copies share
+        # it instead of deep-copying the parsed SVG path on every animation
+        clone_from_id[id(self.path_obj)] = self.path_obj
+        parent = super()
+        if hasattr(parent, "__deepcopy__"):
+            result: Self = parent.__deepcopy__(clone_from_id)
+            return result
+        # OpenGL bases (swapped in by ConvertToOpenGL) have no __deepcopy__:
+        # do what copy.deepcopy does for them
+        result = self.__class__.__new__(self.__class__)
+        clone_from_id[id(self)] = result
+        result.__dict__.update(copy.deepcopy(self.__dict__, clone_from_id))
+        return result
 
     def generate_points(self) -> Self:
         # TODO: cache mobject in a re-importable way

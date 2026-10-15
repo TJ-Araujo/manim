@@ -64,7 +64,7 @@ from ..utils import opengl, space_ops
 from ..utils.exceptions import RerunSceneException
 from ..utils.family import extract_mobject_family_members
 from ..utils.family_ops import restructure_list_to_exclude_certain_family_members
-from ..utils.iterables import list_difference_update, list_update
+from ..utils.iterables import list_update
 from ..utils.module_ops import scene_classes_from_file
 
 if TYPE_CHECKING:
@@ -987,10 +987,9 @@ class Scene:
             moving_mobjects,
             use_z_index=self.renderer.camera.use_z_index,
         )
-        static_mobjects = list_difference_update(
-            all_mobject_families,
-            all_moving_mobject_families,
-        )
+        # list_difference_update, without its quadratic list scan (mobjects compare by identity)
+        moving = set(all_moving_mobject_families)
+        static_mobjects = [m for m in all_mobject_families if m not in moving]
         return all_moving_mobject_families, static_mobjects
 
     def compile_animations(

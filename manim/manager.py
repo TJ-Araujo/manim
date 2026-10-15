@@ -11,6 +11,7 @@ from . import logger
 from .scene.section import DefaultSectionType
 from .utils.exceptions import EndSceneEarlyException, RerunSceneException
 from .utils.file_ops import open_media_file
+from .utils.sounds import audio_timeline
 
 if TYPE_CHECKING:
     from ._config.output import OutputSpec
@@ -336,6 +337,6 @@ class Manager(Generic[SceneT]):
             Additional arguments forwarded to
             :meth:`~manim.scene.scene_file_writer.SceneFileWriter.add_sound`.
         """
-        if self.skip_animations:
+        if self.skip_animations and not audio_timeline():
             return
         self.file_writer.add_sound(sound_file, self.time + time_offset, gain, **kwargs)

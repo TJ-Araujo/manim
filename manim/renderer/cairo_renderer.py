@@ -3,15 +3,18 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 from manim.utils.hashing import get_hash_from_play_call
 
 from .. import config, logger
 from .._config.video_encoder import video_encoder_fingerprint
 from ..camera.camera import Camera
 from ..mobject.mobject import Mobject, _AnimationBuilder
-from ..scene.scene_file_writer import SceneFileWriter
+from ..scene.scene_file_writer import SceneFileWriter, _ffmpeg_stream_args
 from ..utils.exceptions import EndSceneEarlyException
 from ..utils.iterables import list_update
+from ..utils.sounds import audio_timeline
 from .protocol import RendererCapabilities
 
 if TYPE_CHECKING:
@@ -83,12 +86,19 @@ class CairoRenderer:
         if self.skip_animations:
             logger.debug(f"Skipping animation {self.num_plays}")
             hash_current_animation = None
-            self.time += scene.duration
+            if not audio_timeline():
+                self.time += scene.duration
         else:
             if config["disable_caching"]:
                 logger.info("Caching disabled.")
                 hash_current_animation = f"uncached_{self.num_plays:05}"
             else:
+                if _ffmpeg_stream_args() is not None:
+                    # a cached play would be missing from the stream
+                    raise ValueError(
+                        "MANIM_FFMPEG_STREAM writes no partial movie files: "
+                        "render with --disable_caching"
+                    )
                 assert scene.animations is not None
                 hash_current_animation = get_hash_from_play_call(
                     scene,
@@ -122,6 +132,20 @@ class CairoRenderer:
         )
         scene.begin_animations()
 
+        if self.skip_animations:
+            # add_frame drops every frame of a skipped play, so do not draw them;
+            # the next play and scene_finished reset static_image before drawing
+            self.static_image = None
+            self.init_camera_as_if_drawn(scene)
+            frozen = scene.is_current_animation_frozen_frame()
+            if audio_timeline():
+                self.advance_time_like_render(scene, frozen)
+            if not frozen:
+                scene.play_internal(skip_rendering=True)
+            self.file_writer.end_animation(False)
+            self.num_plays += 1
+            return
+
         # Save a static image, to avoid rendering non moving objects.
         self.save_static_frame_data(scene, scene.static_mobjects)
 
@@ -135,6 +159,42 @@ class CairoRenderer:
         self.file_writer.end_animation(not self.skip_animations)
 
         self.num_plays += 1
+
+    def init_camera_as_if_drawn(self, scene: Scene) -> None:
+        """Set the camera state that a skipped play's draws would have set.
+
+        Camera.display_funcs is created by type_or_raise on the first displayed
+        mobject, and the camera is part of the play hash: without this, the
+        first hash after skipped (or cached) plays would differ.
+        """
+        if getattr(self.camera, "display_funcs", None) is None:
+            mobjects = self.camera.get_mobjects_to_display(
+                list_update(scene.mobjects, scene.foreground_mobjects)
+            )
+            if mobjects:
+                self.camera.type_or_raise(mobjects[0])
+
+    def advance_time_like_render(self, scene: Scene, frozen: bool) -> None:
+        """Advance self.time exactly as a rendered play would (see add_frame).
+
+        Render mode adds dt per frame of np.arange(0, run_time, 1 / fps), or
+        int(run_time / dt) * dt for a frozen frame, while skip mode adds the
+        exact run_time; sounds placed by self.time then drift by up to the
+        frame remainders summed over all earlier plays.
+        """
+        from ..animation.animation import Wait
+
+        if any(
+            isinstance(a, Wait) and a.stop_condition is not None
+            for a in scene.animations or ()
+        ):
+            raise NotImplementedError("MANIM_AUDIO_TIMELINE cannot predict wait_until")
+        dt = 1 / self.camera.frame_rate
+        if frozen:
+            self.time += int(scene.duration / dt) * dt
+            return
+        for _ in range(len(np.arange(0, scene.duration, 1 / config["frame_rate"]))):
+            self.time += 1 * dt
 
     def update_frame(  # TODO Description in Docstring
         self,
